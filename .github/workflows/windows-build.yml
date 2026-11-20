@@ -1,0 +1,156 @@
+name: Build Windows installer
+
+# Runs here, in the public release repository, where GitHub's Windows machines cost nothing. The
+# source is the private cencori/Tensor at the tag asked for, fetched with a read-only token
+# (secret TENSOR_SOURCE_TOKEN: a fine-grained token with Contents read on cencori/Tensor only).
+# This repository's logs are public: they show the build's steps and output, never the secrets.
+# The result goes to a draft release here, which only people with write access can see.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The cencori/Tensor tag to build, like v0.4.19
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build-${{ inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      # The vendored runtime's normal release profile keeps line tables and enables thin LTO.
+      # That is useful for standalone runtime releases, but on GitHub's Windows runner the final
+      # tensor-cli compile/link alone can exceed two hours. Tensor ships the executable inside the
+      # desktop app and does not publish Windows symbol files, so use lighter release optimization,
+      # parallel code generation, and a much cheaper final link here.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_PROFILE_RELEASE_DEBUG: "none"
+      CARGO_PROFILE_RELEASE_STRIP: "symbols"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "64"
+
+    steps:
+      - name: Check out Tensor at the tag
+        uses: actions/checkout@v4
+        with:
+          repository: cencori/Tensor
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.TENSOR_SOURCE_TOKEN }}
+          # Nothing of the token is left in the checkout for later steps to use.
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.95.0
+
+      - name: Cache Rust dependencies and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/tensor/tensor-rs/target
+          key: windows-rust-${{ runner.os }}-${{ hashFiles('vendor/tensor/tensor-rs/Cargo.lock') }}-${{ hashFiles('vendor/tensor/tensor-rs/**/*.rs') }}
+          restore-keys: |
+            windows-rust-${{ runner.os }}-${{ hashFiles('vendor/tensor/tensor-rs/Cargo.lock') }}-
+            windows-rust-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows runtime
+        run: pnpm --filter @tensor/desktop runtime:build --all
+
+      # Save the expensive Rust output as soon as it exists. The combined cache action normally
+      # saves at the end of a successful job, which means a later packaging failure or job timeout
+      # would throw away hours of compilation and make the next attempt cold again.
+      - name: Save Windows Rust build cache
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/tensor/tensor-rs/target
+          key: windows-rust-${{ runner.os }}-${{ hashFiles('vendor/tensor/tensor-rs/Cargo.lock') }}-${{ hashFiles('vendor/tensor/tensor-rs/**/*.rs') }}
+
+      - name: Fetch Windows command-line tools
+        run: pnpm --filter @tensor/desktop tools:fetch --platform win32-x64
+
+      - name: Build Windows installer and ZIP
+        run: pnpm --filter @tensor/desktop package:win
+
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          $artifacts = @(
+            Get-ChildItem apps/desktop/release -Recurse -File |
+              Where-Object { $_.Name -like '*-setup.exe' -or $_.Name -like '*-win.zip' }
+          )
+
+          if ($artifacts.Count -eq 0) {
+            throw 'The Windows build completed without producing an installer or ZIP.'
+          }
+
+          $checksums = $artifacts | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+
+          $checksums | Set-Content apps/desktop/release/SHA256SUMS.txt
+
+      # A two-hour build must not be lost to where it is kept. Workflow artifacts share one storage
+      # quota across the whole account, and when it is full the upload fails after everything else
+      # has succeeded. A draft release is outside that quota and visible only to people with write
+      # access; its tag is not created unless someone publishes it, which nobody should.
+      - name: Attach Windows build to a draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content apps/desktop/package.json | ConvertFrom-Json).version
+          $files = @(
+            Get-ChildItem apps/desktop/release -Recurse -File |
+              Where-Object { $_.Name -like '*-setup.exe' -or $_.Name -like '*-win.zip' } |
+              ForEach-Object { $_.FullName }
+          )
+          gh release create "windows-build-$version-${{ github.run_number }}" `
+            --draft `
+            --title "Windows build $version (run ${{ github.run_number }})" `
+            --notes "Windows build of cencori/Tensor ${{ inputs.tag }}. Not a release until its files are published." `
+            @files apps/desktop/release/SHA256SUMS.txt
+
+      - name: Upload Windows build
+        # Kept for convenience, but no longer the only copy: see the step above.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tensor-Windows-x64-${{ github.run_number }}
+          path: |
+            apps/desktop/release/**/*-setup.exe
+            apps/desktop/release/**/*-win.zip
+            apps/desktop/release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
