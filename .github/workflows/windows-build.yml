@@ -135,7 +135,9 @@ jobs:
               Where-Object { $_.Name -like '*-setup.exe' -or $_.Name -like '*-win.zip' } |
               ForEach-Object { $_.FullName }
           )
+          # This repository, by name: the checkout is cencori/Tensor, which gh would pick otherwise.
           gh release create "windows-build-$version-${{ github.run_number }}" `
+            --repo $env:GITHUB_REPOSITORY `
             --draft `
             --title "Windows build $version (run ${{ github.run_number }})" `
             --notes "Windows build of cencori/Tensor ${{ inputs.tag }}. Not a release until its files are published." `
